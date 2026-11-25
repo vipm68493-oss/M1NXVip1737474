@@ -6,6 +6,8 @@ import sqlite3
 import threading
 import subprocess
 import asyncio
+import sysconfig
+import pkgutil
 from datetime import datetime
 from flask import Flask, request, session, redirect, url_for, render_template_string
 from telegram import (
@@ -23,6 +25,33 @@ app.secret_key = os.environ.get("SECRET_KEY", "m1nx-secret-change-me")
 OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "owner")
 OWNER_ID = int(os.environ.get("OWNER_ID", "7765423734"))
 DB_PATH = "/tmp/m1nx.db"
+
+# ==================== AUTO STDLIB DETECTION ====================
+def get_stdlib_modules():
+    """Automatically get all standard library module names."""
+    stdlib = set(sys.builtin_module_names)
+    try:
+        stdlib_path = sysconfig.get_paths()["stdlib"]
+        for m in pkgutil.iter_modules([stdlib_path]):
+            stdlib.add(m.name)
+    except Exception:
+        pass
+    # Add common ones that might be missed
+    stdlib.update({
+        "urllib", "http", "email", "xml", "html", "test", "unittest",
+        "tkinter", "sqlite3", "json", "re", "os", "sys", "time",
+        "datetime", "math", "random", "threading", "asyncio",
+        "subprocess", "typing", "collections", "pathlib", "logging",
+        "traceback", "base64", "hashlib", "uuid", "socket", "io",
+        "shutil", "tempfile", "glob", "csv", "itertools", "functools",
+        "ssl", "ftplib", "smtplib", "pickle", "copy", "warnings",
+        "contextlib", "abc", "inspect", "ast", "dis", "gc", "weakref",
+        "struct", "array", "binascii", "codecs", "locale", "gettext",
+        "argparse", "configparser", "shlex", "signal", "errno"
+    })
+    return stdlib
+
+STDLIB_MODULES = get_stdlib_modules()
 
 # ==================== DATABASE ====================
 def db():
@@ -139,7 +168,7 @@ def add_log(key, line):
 def proc_key(uid, fname):
     return f"{uid}:{fname}"
 
-# ==================== MENU ====================
+# ==================== MENU & COMMANDS ====================
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "OPEN MAIN MENU"),
@@ -147,6 +176,7 @@ async def post_init(application: Application):
         BotCommand("status", "SYSTEM STATUS"),
         BotCommand("help", "HOW TO USE"),
     ])
+    # This sets the 3-line Menu button
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
 def main_kb(uid):
@@ -161,7 +191,7 @@ def main_kb(uid):
         kb.append([InlineKeyboardButton("👥 USERS", callback_data="users")])
     return InlineKeyboardMarkup(kb)
 
-# ==================== HANDLERS ====================
+# ==================== TELEGRAM HANDLERS ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id
@@ -267,41 +297,43 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(path, "w") as fp:
             fp.write(f["code"])
 
-        msg = await q.edit_message_text(f"⏳ *PREPARING {fname.upper()}...*",
-                                        parse_mode="Markdown")
+        msg = await q.edit_message_text(f"⏳ *PREPARING {fname.upper()}...*", parse_mode="Markdown")
         t0 = time.time()
+
+        # Detect imports and filter out stdlib
         imports = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z0-9_]+)", f["code"], re.M))
-        stdlib = set(sys.builtin_module_names)
-        skip = {"os", "sys", "time", "json", "re", "asyncio", "threading", "random",
-                "datetime", "math", "subprocess", "typing", "collections", "pathlib",
-                "logging", "traceback", "base64", "hashlib", "uuid", "socket", "io",
-                "sqlite3", "shutil", "tempfile", "glob", "csv", "itertools", "functools"}
-        to_install = [m for m in imports if m not in stdlib and m not in skip]
+        to_install = [m for m in imports if m not in STDLIB_MODULES]
+
         if to_install:
             await msg.edit_text(
                 f"📦 *INSTALLING:* {', '.join(to_install).upper()}\n"
-                f"⏱️ ESTIMATED: ~{len(to_install)*10} SECONDS",
+                f"⏱️ *PLEASE WAIT...*",
                 parse_mode="Markdown",
             )
             try:
-                r = subprocess.run(
+                proc_install = subprocess.Popen(
                     [sys.executable, "-m", "pip", "install", "-q", *to_install],
-                    capture_output=True, text=True, timeout=120,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
                 )
-                if r.returncode != 0:
-                    err = (r.stderr or r.stdout)[-600:]
-                    await msg.edit_text(
-                        f"❌ *INSTALL FAILED*\n```\n{err}\n```",
-                        parse_mode="Markdown",
-                    )
+                # Read real-time output for loading screen
+                for line in iter(proc_install.stdout.readline, ""):
+                    elapsed = int(time.time() - t0)
+                    if line.strip():
+                        await msg.edit_text(
+                            f"📦 *INSTALLING...* ({elapsed}s)\n```\n{line.strip()[:200]}\n```",
+                            parse_mode="Markdown",
+                        )
+                proc_install.wait()
+                if proc_install.returncode != 0:
+                    await msg.edit_text("❌ *INSTALL FAILED*. CHECK PACKAGE NAME.")
                     return
-            except subprocess.TimeoutExpired:
-                await msg.edit_text("❌ INSTALL TIMED OUT.")
+            except Exception as e:
+                await msg.edit_text(f"❌ *INSTALL ERROR:* {str(e)[:200]}")
                 return
 
         elapsed = int(time.time() - t0)
         await msg.edit_text(
-            f"🚀 *STARTING {fname.upper()}...*\n⏱️ PREP TOOK {elapsed}S",
+            f"🚀 *STARTING {fname.upper()}...*\n⏱️ *PREP TOOK {elapsed}s*",
             parse_mode="Markdown",
         )
         proc = subprocess.Popen(
@@ -542,6 +574,11 @@ def index():
             STATE["bot_username"] = None
             threading.Thread(target=run_bot, args=(token,), daemon=True).start()
             return redirect(url_for("index"))
+
+    # Auto-start bot if token exists in DB and not running
+    saved_token = db_get("bot_token")
+    if saved_token and not STATE["bot_running"] and not STATE["bot_username"]:
+        threading.Thread(target=run_bot, args=(saved_token,), daemon=True).start()
 
     running = STATE["bot_running"]
     html = """
