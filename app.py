@@ -1,11 +1,17 @@
 import os
 import sys
+import re
+import time
+import sqlite3
 import threading
 import subprocess
 import asyncio
 from datetime import datetime
 from flask import Flask, request, session, redirect, url_for, render_template_string
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, MenuButtonCommands
+)
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -14,86 +20,175 @@ from telegram.ext import (
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "m1nx-secret-change-me")
 
-# ==================== CONFIG ====================
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "owner")
+OWNER_ID = int(os.environ.get("OWNER_ID", "7765423734"))
+DB_PATH = "/tmp/m1nx.db"
 
-# 🔴 REAL ADMIN ID (fixed, never changes)
-REAL_ADMIN_ID = 7765423734
+# ==================== DATABASE ====================
+def db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+def init_db():
+    c = db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS users (
+        uid INTEGER PRIMARY KEY,
+        username TEXT,
+        allowed INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid INTEGER,
+        filename TEXT,
+        code TEXT,
+        UNIQUE(uid, filename)
+    );
+    """)
+    c.commit()
+    c.close()
+
+init_db()
+
+def db_get(key, default=None):
+    c = db()
+    row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    c.close()
+    return row["value"] if row else default
+
+def db_set(key, value):
+    c = db()
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+    c.commit()
+    c.close()
+
+def db_user(uid, username=None, allowed=None):
+    c = db()
+    row = c.execute("SELECT * FROM users WHERE uid=?", (uid,)).fetchone()
+    if row is None:
+        c.execute("INSERT INTO users(uid,username,allowed) VALUES(?,?,?)",
+                  (uid, username or "", 1 if allowed else 0))
+    else:
+        if username is not None:
+            c.execute("UPDATE users SET username=? WHERE uid=?", (username, uid))
+        if allowed is not None:
+            c.execute("UPDATE users SET allowed=? WHERE uid=?", (1 if allowed else 0, uid))
+    c.commit()
+    c.close()
+
+def db_get_user(uid):
+    c = db()
+    row = c.execute("SELECT * FROM users WHERE uid=?", (uid,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+def db_all_users():
+    c = db()
+    rows = c.execute("SELECT * FROM users").fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+def db_save_file(uid, filename, code):
+    c = db()
+    c.execute("INSERT OR REPLACE INTO files(uid,filename,code) VALUES(?,?,?)",
+              (uid, filename, code))
+    c.commit()
+    c.close()
+
+def db_get_file(uid, filename):
+    c = db()
+    row = c.execute("SELECT * FROM files WHERE uid=? AND filename=?",
+                    (uid, filename)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
+def db_user_files(uid):
+    c = db()
+    rows = c.execute("SELECT filename FROM files WHERE uid=?", (uid,)).fetchall()
+    c.close()
+    return [r["filename"] for r in rows]
+
+def db_del_file(uid, filename):
+    c = db()
+    c.execute("DELETE FROM files WHERE uid=? AND filename=?", (uid, filename))
+    c.commit()
+    c.close()
+
+# ==================== STATE ====================
 STATE = {
-    "bot_token": None,
     "bot_username": None,
     "bot_running": False,
-    "users": {},            # user_id -> {"username": ..., "allowed": False}
-    "files": {},            # filename -> code
-    "processes": {},        # filename -> Popen
-    "logs": {},             # filename -> [lines]
+    "processes": {},
+    "logs": {},
 }
 
-# ==================== HELPERS ====================
-def is_logged_in():
-    return session.get("logged_in") is True
-
-def now():
-    return datetime.now().strftime("%H:%M:%S")
+def is_allowed(uid):
+    if uid == OWNER_ID:
+        return True
+    u = db_get_user(uid)
+    return bool(u and u["allowed"])
 
 def add_log(key, line):
     STATE["logs"].setdefault(key, [])
-    STATE["logs"][key].append(f"[{now()}] {line}")
+    STATE["logs"][key].append(f"[{datetime.now().strftime('%H:%M:%S')}] {line}")
     if len(STATE["logs"][key]) > 200:
         STATE["logs"][key].pop(0)
 
-def is_allowed(uid):
-    if uid == REAL_ADMIN_ID:
-        return True
-    return STATE["users"].get(uid, {}).get("allowed", False)
+def proc_key(uid, fname):
+    return f"{uid}:{fname}"
 
-def main_menu_kb(uid):
+# ==================== MENU ====================
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "OPEN MAIN MENU"),
+        BotCommand("files", "LIST YOUR FILES"),
+        BotCommand("status", "SYSTEM STATUS"),
+        BotCommand("help", "HOW TO USE"),
+    ])
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+def main_kb(uid):
     kb = [
-        [InlineKeyboardButton("📂 My Files", callback_data="files"),
-         InlineKeyboardButton("🚀 Running Bots", callback_data="running")],
-        [InlineKeyboardButton("📊 Status", callback_data="status"),
-         InlineKeyboardButton("❓ Help", callback_data="help")],
+        [InlineKeyboardButton("📂 MY FILES", callback_data="files"),
+         InlineKeyboardButton("🚀 RUNNING", callback_data="running")],
+        [InlineKeyboardButton("📊 STATUS", callback_data="status"),
+         InlineKeyboardButton("❓ HELP", callback_data="help")],
+        [InlineKeyboardButton("📤 UPLOAD FILE", callback_data="upload")],
     ]
-    if uid == REAL_ADMIN_ID:
-        kb.append([InlineKeyboardButton("👥 Users", callback_data="users")])
+    if uid == OWNER_ID:
+        kb.append([InlineKeyboardButton("👥 USERS", callback_data="users")])
     return InlineKeyboardMarkup(kb)
 
-# ==================== TELEGRAM HANDLERS ====================
+# ==================== HANDLERS ====================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid = user.id
-    uname = user.username or "NoUsername"
+    uname = user.username or "NOUSERNAME"
 
-    # Register/update user
-    if uid not in STATE["users"]:
-        STATE["users"][uid] = {"username": uname, "allowed": False}
-    else:
-        STATE["users"][uid]["username"] = uname
-
+    db_user(uid, uname)
     if not is_allowed(uid):
-        kb = [[InlineKeyboardButton("📋 Copy Admin ID", callback_data=f"copyadmin:{REAL_ADMIN_ID}")]]
+        kb = [[InlineKeyboardButton("📋 COPY OWNER ID", callback_data=f"copyowner:{OWNER_ID}")]]
         await update.message.reply_text(
-            f"⛔ *Access Denied*\n\n"
-            f"Hello @{uname},\n"
-            f"Your ID `{uid}` is not authorized to use this bot.\n\n"
-            f"Please contact the admin:\n"
-            f"👑 Admin ID: `{REAL_ADMIN_ID}`\n\n"
-            f"Ask the admin to enable your access.",
+            f"⛔ *VERIFICATION REQUIRED*\n\n"
+            f"HELLO @{uname.upper()}, YOU ARE NOT VERIFIED YET.\n"
+            f"PLEASE CONTACT THE OWNER AND ASK FOR ACCESS.\n\n"
+            f"👑 OWNER ID: `{OWNER_ID}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
-    role = "👑 REAL ADMIN" if uid == REAL_ADMIN_ID else "✅ Authorized User"
+    role = "👑 OWNER" if uid == OWNER_ID else "✅ VERIFIED USER"
     await update.message.reply_text(
-        f"*M1NX VIP Python Bot Hosting*\n\n"
-        f"Hello @{uname}\n"
-        f"Role: {role}\n"
+        f"*M1NX VIP PYTHON BOT HOSTING*\n\n"
+        f"HELLO @{uname.upper()}\n"
+        f"ROLE: {role}\n"
         f"ID: `{uid}`\n\n"
-        f"Send me a `.py` file to host it.",
+        f"SEND ME A `.PY` FILE TO HOST IT, OR USE THE BUTTONS BELOW.",
         parse_mode="Markdown",
-        reply_markup=main_menu_kb(uid),
+        reply_markup=main_kb(uid),
     )
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,215 +197,271 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     uid = update.effective_user.id
 
-    # Copy admin id
-    if data.startswith("copyadmin:"):
-        aid = data.split(":", 1)[1]
+    if data.startswith("copyowner:"):
+        oid = data.split(":", 1)[1]
         await q.edit_message_text(
-            f"👑 *Admin ID*\n\n`{aid}`\n\nCopy the ID above and message the admin.",
+            f"👑 *OWNER ID*\n\n`{oid}`\n\nCOPY AND MESSAGE THE OWNER.",
             parse_mode="Markdown",
         )
         return
 
     if not is_allowed(uid):
-        await q.edit_message_text("⛔ Access denied. Contact admin.")
+        await q.edit_message_text("⛔ VERIFICATION REQUIRED. CONTACT OWNER.")
         return
 
-    # ---------- FILES ----------
     if data == "files":
-        if not STATE["files"]:
-            await q.edit_message_text("📂 No files uploaded yet.")
+        files = db_user_files(uid)
+        if not files:
+            await q.edit_message_text("📂 YOU HAVE NO FILES YET. UPLOAD ONE!")
             return
         kb = []
-        for fname in STATE["files"]:
-            running = fname in STATE["processes"] and STATE["processes"][fname].poll() is None
+        for fname in files:
+            p = STATE["processes"].get(proc_key(uid, fname))
+            running = p and p.poll() is None
             icon = "🟢" if running else "🔴"
-            kb.append([InlineKeyboardButton(f"{icon} {fname}", callback_data=f"file:{fname}")])
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
-        await q.edit_message_text("📂 *Hosted Files*", parse_mode="Markdown",
+            kb.append([InlineKeyboardButton(f"{icon} {fname.upper()}",
+                                            callback_data=f"file:{fname}")])
+        kb.append([InlineKeyboardButton("⬅️ BACK", callback_data="back")])
+        await q.edit_message_text("📂 *YOUR FILES*", parse_mode="Markdown",
                                   reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data == "upload":
+        await q.edit_message_text("📤 SEND ME A `.PY` FILE NOW.")
 
     elif data.startswith("file:"):
         fname = data.split(":", 1)[1]
-        if fname not in STATE["files"]:
-            await q.edit_message_text("❌ File not found.")
+        f = db_get_file(uid, fname)
+        if not f:
+            await q.edit_message_text("❌ FILE NOT FOUND.")
             return
-        running = fname in STATE["processes"] and STATE["processes"][fname].poll() is None
-        status = "🟢 Running" if running else "🔴 Stopped"
+        p = STATE["processes"].get(proc_key(uid, fname))
+        running = p and p.poll() is None
+        status = "🟢 RUNNING" if running else "🔴 STOPPED"
         kb = [
-            [InlineKeyboardButton("▶️ Run", callback_data=f"run:{fname}"),
-             InlineKeyboardButton("⏹ Stop", callback_data=f"stop:{fname}")],
-            [InlineKeyboardButton("📥 Download", callback_data=f"dl:{fname}"),
-             InlineKeyboardButton("📋 Logs", callback_data=f"log:{fname}")],
-            [InlineKeyboardButton("🗑 Delete", callback_data=f"del:{fname}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="files")],
+            [InlineKeyboardButton("▶️ RUN", callback_data=f"run:{fname}"),
+             InlineKeyboardButton("⏹ STOP", callback_data=f"stop:{fname}")],
+            [InlineKeyboardButton("📥 DOWNLOAD", callback_data=f"dl:{fname}"),
+             InlineKeyboardButton("📋 LOGS", callback_data=f"log:{fname}")],
+            [InlineKeyboardButton("🗑 DELETE", callback_data=f"del:{fname}")],
+            [InlineKeyboardButton("⬅️ BACK", callback_data="files")],
         ]
         await q.edit_message_text(
-            f"📄 *{fname}*\nStatus: {status}",
+            f"📄 *{fname.upper()}*\nSTATUS: {status}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
     elif data.startswith("run:"):
         fname = data.split(":", 1)[1]
-        if fname in STATE["processes"] and STATE["processes"][fname].poll() is None:
-            await q.edit_message_text(f"⚠️ `{fname}` already running.", parse_mode="Markdown")
+        f = db_get_file(uid, fname)
+        if not f:
+            await q.edit_message_text("❌ FILE NOT FOUND.")
             return
-        path = f"/tmp/{fname}"
-        with open(path, "w") as f:
-            f.write(STATE["files"][fname])
+        pk = proc_key(uid, fname)
+        p = STATE["processes"].get(pk)
+        if p and p.poll() is None:
+            await q.edit_message_text(f"⚠️ `{fname}` ALREADY RUNNING.", parse_mode="Markdown")
+            return
+
+        path = f"/tmp/{uid}_{fname}"
+        with open(path, "w") as fp:
+            fp.write(f["code"])
+
+        msg = await q.edit_message_text(f"⏳ *PREPARING {fname.upper()}...*",
+                                        parse_mode="Markdown")
+        t0 = time.time()
+        imports = set(re.findall(r"^\s*(?:import|from)\s+([a-zA-Z0-9_]+)", f["code"], re.M))
+        stdlib = set(sys.builtin_module_names)
+        skip = {"os", "sys", "time", "json", "re", "asyncio", "threading", "random",
+                "datetime", "math", "subprocess", "typing", "collections", "pathlib",
+                "logging", "traceback", "base64", "hashlib", "uuid", "socket", "io",
+                "sqlite3", "shutil", "tempfile", "glob", "csv", "itertools", "functools"}
+        to_install = [m for m in imports if m not in stdlib and m not in skip]
+        if to_install:
+            await msg.edit_text(
+                f"📦 *INSTALLING:* {', '.join(to_install).upper()}\n"
+                f"⏱️ ESTIMATED: ~{len(to_install)*10} SECONDS",
+                parse_mode="Markdown",
+            )
+            try:
+                r = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "-q", *to_install],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if r.returncode != 0:
+                    err = (r.stderr or r.stdout)[-600:]
+                    await msg.edit_text(
+                        f"❌ *INSTALL FAILED*\n```\n{err}\n```",
+                        parse_mode="Markdown",
+                    )
+                    return
+            except subprocess.TimeoutExpired:
+                await msg.edit_text("❌ INSTALL TIMED OUT.")
+                return
+
+        elapsed = int(time.time() - t0)
+        await msg.edit_text(
+            f"🚀 *STARTING {fname.upper()}...*\n⏱️ PREP TOOK {elapsed}S",
+            parse_mode="Markdown",
+        )
         proc = subprocess.Popen(
             [sys.executable, "-u", path],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        STATE["processes"][fname] = proc
-        add_log(fname, f"Started PID {proc.pid}")
+        STATE["processes"][pk] = proc
+        add_log(pk, f"STARTED PID {proc.pid}")
 
         def collect():
             for line in iter(proc.stdout.readline, ""):
-                add_log(fname, line.rstrip())
+                add_log(pk, line.rstrip())
             proc.wait()
-            add_log(fname, "Process ended")
+            add_log(pk, "PROCESS ENDED")
 
         threading.Thread(target=collect, daemon=True).start()
-        await q.edit_message_text(f"🚀 Started `{fname}` (PID {proc.pid})", parse_mode="Markdown")
+        await msg.edit_text(
+            f"✅ *{fname.upper()} IS RUNNING*\nPID: `{proc.pid}`\n\nUSE *LOGS* TO SEE OUTPUT.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📋 LOGS", callback_data=f"log:{fname}"),
+                  InlineKeyboardButton("⏹ STOP", callback_data=f"stop:{fname}")]]
+            ),
+        )
 
     elif data.startswith("stop:"):
         fname = data.split(":", 1)[1]
-        proc = STATE["processes"].get(fname)
-        if not proc or proc.poll() is not None:
-            await q.edit_message_text(f"⚠️ `{fname}` not running.", parse_mode="Markdown")
+        p = STATE["processes"].get(proc_key(uid, fname))
+        if not p or p.poll() is not None:
+            await q.edit_message_text(f"⚠️ `{fname}` NOT RUNNING.", parse_mode="Markdown")
             return
-        proc.terminate()
-        add_log(fname, "Stopped")
-        await q.edit_message_text(f"🛑 Stopped `{fname}`", parse_mode="Markdown")
+        p.terminate()
+        add_log(proc_key(uid, fname), "STOPPED")
+        await q.edit_message_text(f"🛑 STOPPED `{fname}`", parse_mode="Markdown")
 
     elif data.startswith("dl:"):
         fname = data.split(":", 1)[1]
-        if fname not in STATE["files"]:
-            await q.edit_message_text("❌ File not found.")
+        f = db_get_file(uid, fname)
+        if not f:
+            await q.edit_message_text("❌ FILE NOT FOUND.")
             return
-        tmp = f"/tmp/{fname}"
-        with open(tmp, "w") as f:
-            f.write(STATE["files"][fname])
+        tmp = f"/tmp/{uid}_{fname}"
+        with open(tmp, "w") as fp:
+            fp.write(f["code"])
         await q.message.reply_document(document=open(tmp, "rb"), filename=fname)
-        await q.edit_message_text(f"📥 Sent `{fname}`", parse_mode="Markdown")
+        await q.edit_message_text(f"📥 SENT `{fname}`", parse_mode="Markdown")
 
     elif data.startswith("log:"):
         fname = data.split(":", 1)[1]
-        lines = STATE["logs"].get(fname, [])
-        text = "\n".join(lines[-25:]) if lines else "No logs yet."
-        await q.edit_message_text(f"📋 *Logs for {fname}*\n```\n{text}\n```",
+        lines = STATE["logs"].get(proc_key(uid, fname), [])
+        text = "\n".join(lines[-25:]) if lines else "NO LOGS YET."
+        await q.edit_message_text(f"📋 *LOGS FOR {fname.upper()}*\n```\n{text}\n```",
                                   parse_mode="Markdown")
 
     elif data.startswith("del:"):
         fname = data.split(":", 1)[1]
-        proc = STATE["processes"].get(fname)
-        if proc and proc.poll() is None:
-            await q.edit_message_text("⚠️ Stop the bot before deleting.", parse_mode="Markdown")
+        p = STATE["processes"].get(proc_key(uid, fname))
+        if p and p.poll() is None:
+            await q.edit_message_text("⚠️ STOP THE BOT BEFORE DELETING.", parse_mode="Markdown")
             return
-        STATE["files"].pop(fname, None)
-        STATE["processes"].pop(fname, None)
-        STATE["logs"].pop(fname, None)
-        await q.edit_message_text(f"🗑 Deleted `{fname}`", parse_mode="Markdown")
+        db_del_file(uid, fname)
+        STATE["processes"].pop(proc_key(uid, fname), None)
+        STATE["logs"].pop(proc_key(uid, fname), None)
+        await q.edit_message_text(f"🗑 DELETED `{fname}`", parse_mode="Markdown")
 
-    # ---------- RUNNING ----------
     elif data == "running":
-        if not STATE["processes"]:
-            await q.edit_message_text("🚀 No processes running.")
-            return
         lines = []
-        for fname, proc in STATE["processes"].items():
-            alive = proc.poll() is None
-            lines.append(f"{'🟢' if alive else '🔴'} `{fname}` (PID {proc.pid})")
-        await q.edit_message_text("🚀 *Running Bots*\n\n" + "\n".join(lines),
+        for pk, p in STATE["processes"].items():
+            if pk.startswith(f"{uid}:"):
+                fname = pk.split(":", 1)[1]
+                alive = p.poll() is None
+                lines.append(f"{'🟢' if alive else '🔴'} `{fname}`")
+        if not lines:
+            await q.edit_message_text("🚀 NO PROCESSES RUNNING.")
+            return
+        await q.edit_message_text("🚀 *RUNNING BOTS*\n\n" + "\n".join(lines),
                                   parse_mode="Markdown")
 
-    # ---------- STATUS ----------
     elif data == "status":
         text = (
-            f"📊 *System Status*\n\n"
-            f"Bot Username: @{STATE['bot_username'] or 'N/A'}\n"
-            f"Bot Status: {'🟢 Running' if STATE['bot_running'] else '🔴 Stopped'}\n"
-            f"Total Users: {len(STATE['users'])}\n"
-            f"Allowed Users: {sum(1 for u in STATE['users'].values() if u['allowed'])}\n"
-            f"Hosted Files: {len(STATE['files'])}\n"
-            f"Running Processes: {sum(1 for p in STATE['processes'].values() if p.poll() is None)}"
+            f"📊 *SYSTEM STATUS*\n\n"
+            f"BOT USERNAME: @{STATE['bot_username'] or 'N/A'}\n"
+            f"BOT STATUS: {'🟢 RUNNING' if STATE['bot_running'] else '🔴 STOPPED'}\n"
+            f"TOTAL USERS: {len(db_all_users())}\n"
+            f"YOUR FILES: {len(db_user_files(uid))}\n"
         )
         await q.edit_message_text(text, parse_mode="Markdown")
 
-    # ---------- HELP ----------
     elif data == "help":
         text = (
-            "*📖 Help*\n\n"
-            "Send a `.py` file to host it.\n\n"
-            "Commands:\n"
-            "/start - Main menu\n"
-            "/files - List files\n"
-            "/status - System status\n\n"
-            "Use inline buttons to run, stop, download, view logs, or delete files."
+            "*📖 HELP*\n\n"
+            "SEND A `.PY` FILE TO HOST IT.\n\n"
+            "COMMANDS:\n"
+            "/start - MAIN MENU\n"
+            "/files - YOUR FILES\n"
+            "/status - SYSTEM STATUS\n\n"
+            "USE BUTTONS TO RUN, STOP, DOWNLOAD, VIEW LOGS, OR DELETE."
         )
         await q.edit_message_text(text, parse_mode="Markdown")
 
-    # ---------- USERS (ADMIN ONLY) ----------
     elif data == "users":
-        if uid != REAL_ADMIN_ID:
-            await q.edit_message_text("❌ Admin only.")
+        if uid != OWNER_ID:
+            await q.edit_message_text("❌ OWNER ONLY.")
             return
-        if not STATE["users"]:
-            await q.edit_message_text("👥 No users yet.")
+        all_users = db_all_users()
+        if not all_users:
+            await q.edit_message_text("👥 NO USERS YET.")
             return
         kb = []
-        for u_id, info in STATE["users"].items():
-            icon = "🟢" if info["allowed"] else "🔴"
-            label = f"{icon} @{info['username']} ({u_id})"
-            kb.append([InlineKeyboardButton(label, callback_data=f"user:{u_id}")])
-        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
+        for u in all_users:
+            icon = "🟢" if u["allowed"] or u["uid"] == OWNER_ID else "🔴"
+            kb.append([InlineKeyboardButton(
+                f"{icon} @{(u['username'] or 'NOUSERNAME').upper()} ({u['uid']})",
+                callback_data=f"user:{u['uid']}")])
+        kb.append([InlineKeyboardButton("⬅️ BACK", callback_data="back")])
         await q.edit_message_text(
-            f"👥 *Users* ({len(STATE['users'])} total)\n\n"
-            f"🟢 = allowed   🔴 = blocked",
+            f"👥 *USERS* ({len(all_users)} TOTAL)",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
     elif data.startswith("user:"):
-        if uid != REAL_ADMIN_ID:
-            await q.edit_message_text("❌ Admin only.")
+        if uid != OWNER_ID:
+            await q.edit_message_text("❌ OWNER ONLY.")
             return
         target = int(data.split(":", 1)[1])
-        info = STATE["users"].get(target)
+        info = db_get_user(target)
         if not info:
-            await q.edit_message_text("❌ User not found.")
+            await q.edit_message_text("❌ USER NOT FOUND.")
             return
-        status = "🟢 Allowed" if info["allowed"] else "🔴 Blocked"
-        new_state = "off" if info["allowed"] else "on"
-        btn_label = "⛔ Disable" if info["allowed"] else "✅ Enable"
+        status = "🟢 ALLOWED" if info["allowed"] or target == OWNER_ID else "🔴 BLOCKED"
+        btn_label = "⛔ DISABLE" if info["allowed"] else "✅ ENABLE"
         kb = [
             [InlineKeyboardButton(btn_label, callback_data=f"toggle:{target}")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="users")],
+            [InlineKeyboardButton("⬅️ BACK", callback_data="users")],
         ]
         await q.edit_message_text(
-            f"👤 *User Info*\n\n"
-            f"Username: @{info['username']}\n"
+            f"👤 *USER INFO*\n\n"
+            f"USERNAME: @{(info['username'] or 'NOUSERNAME').upper()}\n"
             f"ID: `{target}`\n"
-            f"Status: {status}",
+            f"STATUS: {status}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
 
     elif data.startswith("toggle:"):
-        if uid != REAL_ADMIN_ID:
-            await q.edit_message_text("❌ Admin only.")
+        if uid != OWNER_ID:
+            await q.edit_message_text("❌ OWNER ONLY.")
             return
         target = int(data.split(":", 1)[1])
-        if target not in STATE["users"]:
-            await q.edit_message_text("❌ User not found.")
+        info = db_get_user(target)
+        if not info:
+            await q.edit_message_text("❌ USER NOT FOUND.")
             return
-        STATE["users"][target]["allowed"] = not STATE["users"][target]["allowed"]
-        info = STATE["users"][target]
-        status = "🟢 Allowed" if info["allowed"] else "🔴 Blocked"
+        new_val = 0 if info["allowed"] else 1
+        db_user(target, allowed=new_val)
+        status = "🟢 ALLOWED" if new_val else "🔴 BLOCKED"
         await q.edit_message_text(
-            f"✅ Updated @{info['username']}\nStatus: {status}",
+            f"✅ UPDATED @{(info['username'] or 'NOUSERNAME').upper()}\nSTATUS: {status}",
             parse_mode="Markdown",
         )
 
@@ -319,29 +470,48 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    uname = update.effective_user.username or "NOUSERNAME"
     if not is_allowed(uid):
-        await update.message.reply_text("⛔ Access denied. Contact admin.")
+        await update.message.reply_text("⛔ VERIFICATION REQUIRED. CONTACT OWNER.")
         return
     doc = update.message.document
     if not doc or not doc.file_name.endswith(".py"):
-        await update.message.reply_text("❌ Only `.py` files allowed.")
+        await update.message.reply_text("❌ ONLY `.PY` FILES ALLOWED.")
         return
+
+    loading = await update.message.reply_text("⏳ UPLOADING FILE...")
     f = await doc.get_file()
     content = await f.download_as_bytearray()
     fname = doc.file_name
-    STATE["files"][fname] = content.decode("utf-8", errors="ignore")
-    add_log(fname, "Uploaded")
-    kb = [[InlineKeyboardButton("▶️ Run Now", callback_data=f"run:{fname}"),
-           InlineKeyboardButton("📋 Details", callback_data=f"file:{fname}")]]
-    await update.message.reply_text(
-        f"✅ Saved `{fname}`",
+    db_save_file(uid, fname, content.decode("utf-8", errors="ignore"))
+    add_log(proc_key(uid, fname), "UPLOADED")
+
+    try:
+        await context.bot.send_message(
+            OWNER_ID,
+            f"📤 *NEW UPLOAD*\nUSER: @{uname.upper()} (`{uid}`)\nFILE: `{fname}`",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+    await loading.edit_text(
+        f"✅ *{fname.upper()} UPLOADED*\n\nUSE THE BUTTONS BELOW.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ RUN", callback_data=f"run:{fname}"),
+            InlineKeyboardButton("📋 DETAILS", callback_data=f"file:{fname}"),
+        ]]),
     )
 
 def run_bot(token):
     async def main():
-        application = Application.builder().token(token).build()
+        application = (
+            Application.builder()
+            .token(token)
+            .post_init(post_init)
+            .build()
+        )
         application.add_handler(CommandHandler("start", start_cmd))
         application.add_handler(CommandHandler("files", lambda u, c: buttons(u, c)))
         application.add_handler(CommandHandler("status", lambda u, c: buttons(u, c)))
@@ -361,13 +531,13 @@ def run_bot(token):
 # ==================== FLASK WEB ====================
 @app.route("/", methods=["GET", "POST"])
 def index():
-    if not is_logged_in():
+    if not session.get("logged_in"):
         return redirect(url_for("login"))
 
     if request.method == "POST":
         token = request.form.get("token", "").strip()
         if token and ":" in token:
-            STATE["bot_token"] = token
+            db_set("bot_token", token)
             STATE["bot_running"] = False
             STATE["bot_username"] = None
             threading.Thread(target=run_bot, args=(token,), daemon=True).start()
@@ -376,7 +546,7 @@ def index():
     running = STATE["bot_running"]
     html = """
     <!doctype html><html><head><meta charset="utf-8">
-    <title>M1NX VIP Bot Hosting</title>
+    <title>M1NX VIP BOT HOSTING</title>
     <style>
     *{box-sizing:border-box}
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
@@ -400,51 +570,38 @@ def index():
            color:#0d1117}
     button:hover{opacity:.9}
     a{color:#58a6ff}
-    ul{padding-left:18px}
     .ok{color:#3fb950}.bad{color:#f85149}
     </style></head><body>
     <div class="container">
-      <h1>🤖 M1NX VIP Bot Hosting</h1>
-      <p class="sub">Premium Python Bot Control Panel • <a href="/logout">Logout</a></p>
-
+      <h1>🤖 M1NX VIP BOT HOSTING</h1>
+      <p class="sub">PREMIUM PYTHON BOT CONTROL PANEL • <a href="/logout">LOGOUT</a></p>
       <div class="card">
         <div class="grid">
-          <div class="stat"><div class="lbl">Status</div>
+          <div class="stat"><div class="lbl">STATUS</div>
             <div class="val {{ 'ok' if running else 'bad' }}">{{ status }}</div></div>
-          <div class="stat"><div class="lbl">Bot</div>
+          <div class="stat"><div class="lbl">BOT</div>
             <div class="val">@{{ username }}</div></div>
-          <div class="stat"><div class="lbl">Users</div>
+          <div class="stat"><div class="lbl">USERS</div>
             <div class="val">{{ user_count }}</div></div>
-          <div class="stat"><div class="lbl">Files</div>
+          <div class="stat"><div class="lbl">FILES</div>
             <div class="val">{{ file_count }}</div></div>
         </div>
       </div>
-
       <div class="card">
-        <h3>🔑 Set Bot Token</h3>
+        <h3>🔑 SET BOT TOKEN</h3>
         <form method="POST">
-          <input type="text" name="token" placeholder="123456:ABC-xyz..." required>
-          <button type="submit">Save & Start</button>
+          <input type="text" name="token" placeholder="123456:ABC-XYZ..." required>
+          <button type="submit">SAVE & START</button>
         </form>
-      </div>
-
-      <div class="card">
-        <h3>📂 Hosted Files</h3>
-        {% if files %}
-          <ul>{% for f in files %}<li>{{ f }}</li>{% endfor %}</ul>
-        {% else %}
-          <p>No files yet. Send a .py file to the bot.</p>
-        {% endif %}
       </div>
     </div></body></html>
     """
     return render_template_string(
         html,
-        status="🟢 Running" if running else "🔴 Stopped",
+        status="🟢 RUNNING" if running else "🔴 STOPPED",
         username=STATE["bot_username"] or "N/A",
-        user_count=len(STATE["users"]),
-        file_count=len(STATE["files"]),
-        files=list(STATE["files"].keys()),
+        user_count=len(db_all_users()),
+        file_count=sum(len(db_user_files(u["uid"])) for u in db_all_users()),
         running=running,
     )
 
@@ -452,12 +609,12 @@ def index():
 def login():
     error = None
     if request.method == "POST":
-        if request.form.get("password") == ADMIN_PASSWORD:
+        if request.form.get("password") == OWNER_PASSWORD:
             session["logged_in"] = True
             return redirect(url_for("index"))
-        error = "❌ Wrong password"
+        error = "❌ WRONG PASSWORD"
     html = """
-    <!doctype html><html><head><meta charset="utf-8"><title>Login</title>
+    <!doctype html><html><head><meta charset="utf-8"><title>LOGIN</title>
     <style>
     body{font-family:system-ui,sans-serif;
          background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);
@@ -474,12 +631,12 @@ def login():
     .err{color:#f85149}
     </style></head><body>
     <div class="card">
-      <h2>🔐 M1NX Hosting</h2>
-      <p style="color:#8b949e;font-size:13px">Enter admin password</p>
+      <h2>🔐 M1NX HOSTING</h2>
+      <p style="color:#8b949e;font-size:13px">ENTER OWNER PASSWORD</p>
       {% if error %}<p class="err">{{ error }}</p>{% endif %}
       <form method="POST">
-        <input type="password" name="password" placeholder="Admin password" required>
-        <button type="submit">Login</button>
+        <input type="password" name="password" placeholder="OWNER PASSWORD" required>
+        <button type="submit">LOGIN</button>
       </form>
     </div></body></html>
     """
