@@ -14,21 +14,23 @@ from telegram.ext import (
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "m1nx-secret-change-me")
 
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "1122")
-OWNER_ID = os.environ.get("OWNER_ID", "")  # optional: your telegram id
+# ==================== CONFIG ====================
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+
+# 🔴 REAL ADMIN ID (fixed, never changes)
+REAL_ADMIN_ID = 7765423734
 
 STATE = {
     "bot_token": None,
     "bot_username": None,
     "bot_running": False,
-    "admin_id": None,
-    "users": {},
-    "files": {},
-    "processes": {},
-    "logs": {},
+    "users": {},            # user_id -> {"username": ..., "allowed": False}
+    "files": {},            # filename -> code
+    "processes": {},        # filename -> Popen
+    "logs": {},             # filename -> [lines]
 }
 
-# ================== HELPERS ==================
+# ==================== HELPERS ====================
 def is_logged_in():
     return session.get("logged_in") is True
 
@@ -41,26 +43,49 @@ def add_log(key, line):
     if len(STATE["logs"][key]) > 200:
         STATE["logs"][key].pop(0)
 
-# ================== TELEGRAM BOT ==================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uid = user.id
-    uname = user.username or "NoUsername"
+def is_allowed(uid):
+    if uid == REAL_ADMIN_ID:
+        return True
+    return STATE["users"].get(uid, {}).get("allowed", False)
 
-    if STATE["admin_id"] is None:
-        STATE["admin_id"] = uid
-        STATE["users"][uid] = uname
-        role = "👑 ADMIN"
-    else:
-        STATE["users"][uid] = uname
-        role = "👑 ADMIN" if uid == STATE["admin_id"] else "👤 USER"
-
+def main_menu_kb(uid):
     kb = [
         [InlineKeyboardButton("📂 My Files", callback_data="files"),
          InlineKeyboardButton("🚀 Running Bots", callback_data="running")],
         [InlineKeyboardButton("📊 Status", callback_data="status"),
          InlineKeyboardButton("❓ Help", callback_data="help")],
     ]
+    if uid == REAL_ADMIN_ID:
+        kb.append([InlineKeyboardButton("👥 Users", callback_data="users")])
+    return InlineKeyboardMarkup(kb)
+
+# ==================== TELEGRAM HANDLERS ====================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = user.id
+    uname = user.username or "NoUsername"
+
+    # Register/update user
+    if uid not in STATE["users"]:
+        STATE["users"][uid] = {"username": uname, "allowed": False}
+    else:
+        STATE["users"][uid]["username"] = uname
+
+    if not is_allowed(uid):
+        kb = [[InlineKeyboardButton("📋 Copy Admin ID", callback_data=f"copyadmin:{REAL_ADMIN_ID}")]]
+        await update.message.reply_text(
+            f"⛔ *Access Denied*\n\n"
+            f"Hello @{uname},\n"
+            f"Your ID `{uid}` is not authorized to use this bot.\n\n"
+            f"Please contact the admin:\n"
+            f"👑 Admin ID: `{REAL_ADMIN_ID}`\n\n"
+            f"Ask the admin to enable your access.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    role = "👑 REAL ADMIN" if uid == REAL_ADMIN_ID else "✅ Authorized User"
     await update.message.reply_text(
         f"*M1NX VIP Python Bot Hosting*\n\n"
         f"Hello @{uname}\n"
@@ -68,14 +93,29 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ID: `{uid}`\n\n"
         f"Send me a `.py` file to host it.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=main_menu_kb(uid),
     )
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
+    uid = update.effective_user.id
 
+    # Copy admin id
+    if data.startswith("copyadmin:"):
+        aid = data.split(":", 1)[1]
+        await q.edit_message_text(
+            f"👑 *Admin ID*\n\n`{aid}`\n\nCopy the ID above and message the admin.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not is_allowed(uid):
+        await q.edit_message_text("⛔ Access denied. Contact admin.")
+        return
+
+    # ---------- FILES ----------
     if data == "files":
         if not STATE["files"]:
             await q.edit_message_text("📂 No files uploaded yet.")
@@ -112,9 +152,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("run:"):
         fname = data.split(":", 1)[1]
-        if update.effective_user.id != STATE["admin_id"]:
-            await q.edit_message_text("❌ Admin only.")
-            return
         if fname in STATE["processes"] and STATE["processes"][fname].poll() is None:
             await q.edit_message_text(f"⚠️ `{fname}` already running.", parse_mode="Markdown")
             return
@@ -145,7 +182,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(f"⚠️ `{fname}` not running.", parse_mode="Markdown")
             return
         proc.terminate()
-        add_log(fname, "Stopped by admin")
+        add_log(fname, "Stopped")
         await q.edit_message_text(f"🛑 Stopped `{fname}`", parse_mode="Markdown")
 
     elif data.startswith("dl:"):
@@ -177,6 +214,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE["logs"].pop(fname, None)
         await q.edit_message_text(f"🗑 Deleted `{fname}`", parse_mode="Markdown")
 
+    # ---------- RUNNING ----------
     elif data == "running":
         if not STATE["processes"]:
             await q.edit_message_text("🚀 No processes running.")
@@ -188,18 +226,20 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🚀 *Running Bots*\n\n" + "\n".join(lines),
                                   parse_mode="Markdown")
 
+    # ---------- STATUS ----------
     elif data == "status":
         text = (
             f"📊 *System Status*\n\n"
             f"Bot Username: @{STATE['bot_username'] or 'N/A'}\n"
             f"Bot Status: {'🟢 Running' if STATE['bot_running'] else '🔴 Stopped'}\n"
-            f"Admin ID: `{STATE['admin_id'] or 'Waiting'}`\n"
             f"Total Users: {len(STATE['users'])}\n"
+            f"Allowed Users: {sum(1 for u in STATE['users'].values() if u['allowed'])}\n"
             f"Hosted Files: {len(STATE['files'])}\n"
             f"Running Processes: {sum(1 for p in STATE['processes'].values() if p.poll() is None)}"
         )
         await q.edit_message_text(text, parse_mode="Markdown")
 
+    # ---------- HELP ----------
     elif data == "help":
         text = (
             "*📖 Help*\n\n"
@@ -212,13 +252,75 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await q.edit_message_text(text, parse_mode="Markdown")
 
+    # ---------- USERS (ADMIN ONLY) ----------
+    elif data == "users":
+        if uid != REAL_ADMIN_ID:
+            await q.edit_message_text("❌ Admin only.")
+            return
+        if not STATE["users"]:
+            await q.edit_message_text("👥 No users yet.")
+            return
+        kb = []
+        for u_id, info in STATE["users"].items():
+            icon = "🟢" if info["allowed"] else "🔴"
+            label = f"{icon} @{info['username']} ({u_id})"
+            kb.append([InlineKeyboardButton(label, callback_data=f"user:{u_id}")])
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
+        await q.edit_message_text(
+            f"👥 *Users* ({len(STATE['users'])} total)\n\n"
+            f"🟢 = allowed   🔴 = blocked",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+    elif data.startswith("user:"):
+        if uid != REAL_ADMIN_ID:
+            await q.edit_message_text("❌ Admin only.")
+            return
+        target = int(data.split(":", 1)[1])
+        info = STATE["users"].get(target)
+        if not info:
+            await q.edit_message_text("❌ User not found.")
+            return
+        status = "🟢 Allowed" if info["allowed"] else "🔴 Blocked"
+        new_state = "off" if info["allowed"] else "on"
+        btn_label = "⛔ Disable" if info["allowed"] else "✅ Enable"
+        kb = [
+            [InlineKeyboardButton(btn_label, callback_data=f"toggle:{target}")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="users")],
+        ]
+        await q.edit_message_text(
+            f"👤 *User Info*\n\n"
+            f"Username: @{info['username']}\n"
+            f"ID: `{target}`\n"
+            f"Status: {status}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+    elif data.startswith("toggle:"):
+        if uid != REAL_ADMIN_ID:
+            await q.edit_message_text("❌ Admin only.")
+            return
+        target = int(data.split(":", 1)[1])
+        if target not in STATE["users"]:
+            await q.edit_message_text("❌ User not found.")
+            return
+        STATE["users"][target]["allowed"] = not STATE["users"][target]["allowed"]
+        info = STATE["users"][target]
+        status = "🟢 Allowed" if info["allowed"] else "🔴 Blocked"
+        await q.edit_message_text(
+            f"✅ Updated @{info['username']}\nStatus: {status}",
+            parse_mode="Markdown",
+        )
+
     elif data == "back":
         await start_cmd(update, context)
 
 async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid != STATE["admin_id"]:
-        await update.message.reply_text("❌ Only admin can upload files.")
+    if not is_allowed(uid):
+        await update.message.reply_text("⛔ Access denied. Contact admin.")
         return
     doc = update.message.document
     if not doc or not doc.file_name.endswith(".py"):
@@ -256,7 +358,7 @@ def run_bot(token):
 
     asyncio.run(main())
 
-# ================== FLASK WEB PANEL ==================
+# ==================== FLASK WEB ====================
 @app.route("/", methods=["GET", "POST"])
 def index():
     if not is_logged_in():
@@ -267,16 +369,13 @@ def index():
         if token and ":" in token:
             STATE["bot_token"] = token
             STATE["bot_running"] = False
-            STATE["admin_id"] = None
             STATE["bot_username"] = None
             threading.Thread(target=run_bot, args=(token,), daemon=True).start()
             return redirect(url_for("index"))
 
+    running = STATE["bot_running"]
     html = """
-    <!doctype html>
-    <html>
-    <head>
-    <meta charset="utf-8">
+    <!doctype html><html><head><meta charset="utf-8">
     <title>M1NX VIP Bot Hosting</title>
     <style>
     *{box-sizing:border-box}
@@ -303,9 +402,7 @@ def index():
     a{color:#58a6ff}
     ul{padding-left:18px}
     .ok{color:#3fb950}.bad{color:#f85149}
-    </style>
-    </head>
-    <body>
+    </style></head><body>
     <div class="container">
       <h1>🤖 M1NX VIP Bot Hosting</h1>
       <p class="sub">Premium Python Bot Control Panel • <a href="/logout">Logout</a></p>
@@ -321,7 +418,6 @@ def index():
           <div class="stat"><div class="lbl">Files</div>
             <div class="val">{{ file_count }}</div></div>
         </div>
-        <p style="margin-top:14px">Admin ID: <b>{{ admin }}</b></p>
       </div>
 
       <div class="card">
@@ -340,16 +436,12 @@ def index():
           <p>No files yet. Send a .py file to the bot.</p>
         {% endif %}
       </div>
-    </div>
-    </body>
-    </html>
+    </div></body></html>
     """
-    running = STATE["bot_running"]
     return render_template_string(
         html,
         status="🟢 Running" if running else "🔴 Stopped",
         username=STATE["bot_username"] or "N/A",
-        admin=STATE["admin_id"] or "Waiting",
         user_count=len(STATE["users"]),
         file_count=len(STATE["files"]),
         files=list(STATE["files"].keys()),
@@ -364,7 +456,6 @@ def login():
             session["logged_in"] = True
             return redirect(url_for("index"))
         error = "❌ Wrong password"
-
     html = """
     <!doctype html><html><head><meta charset="utf-8"><title>Login</title>
     <style>
